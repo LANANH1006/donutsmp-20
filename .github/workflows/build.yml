@@ -1,10 +1,13 @@
+name: Build mod
 
-name: Build DonutLike Mod
-
+# Build Minecraft 1.21.11
+# Chi can sua phan "matrix" ben duoi neu muon doi phien ban.
 on:
-  workflow_dispatch:
   push:
-    branches: [main, master]
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,26 +15,111 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mc: "1.21.11"
+            loom: "1.14-SNAPSHOT"
+            gradle: "9.2.1"
     steps:
-      - name: Checkout source
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 21
+      # Tu tim thu muc chua build.gradle (ke ca khi ban up nguyen thu muc len GitHub)
+      - name: Find project directory
+        id: proj
+        run: |
+          f=$(find . -maxdepth 3 -name build.gradle -not -path './.git/*' | head -n 1)
+          if [ -z "$f" ]; then
+            z=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | head -n 1)
+            if [ -n "$z" ]; then
+              echo "Giai nen $z"
+              unzip -oq "$z" -d _src
+              f=$(find _src -maxdepth 3 -name build.gradle | head -n 1)
+            fi
+          fi
+          if [ -z "$f" ]; then echo "Khong tim thay build.gradle - ban chua up source mod (build.gradle, src/, ...) len repo"; exit 1; fi
+          d=$(dirname "$f")
+          echo "dir=$d" >> "$GITHUB_OUTPUT"
+          echo "Project dir: $d"
+
+      # Tu lay phien ban Yarn / Loader / Fabric API moi nhat cho tung ban Minecraft
+      - name: Resolve Fabric versions for ${{ matrix.mc }}
+        id: ver
+        run: |
+          MC="${{ matrix.mc }}"
+          YARN=$(curl -fsSL "https://meta.fabricmc.net/v2/versions/yarn/$MC" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['version'])")
+          LOADER=$(curl -fsSL "https://meta.fabricmc.net/v2/versions/loader" | python3 -c "import sys,json; print([v for v in json.load(sys.stdin) if v['stable']][0]['version'])")
+          API=$(curl -fsSL "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml" | python3 -c "
+          import sys,re
+          vs=re.findall(r'<version>([^<]+)</version>', sys.stdin.read())
+          mc='$MC'
+          c=[v for v in vs if v.endswith('+'+mc)]
+          print(c[-1])")
+          echo "yarn=$YARN"  >> "$GITHUB_OUTPUT"
+          echo "loader=$LOADER" >> "$GITHUB_OUTPUT"
+          echo "api=$API" >> "$GITHUB_OUTPUT"
+          echo "MC=$MC YARN=$YARN LOADER=$LOADER API=$API"
+
+      - name: Setup JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
 
-      - name: Setup Gradle
+      - name: Setup Gradle ${{ matrix.gradle }}
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ matrix.gradle }}
 
-      - name: Build Fabric Mod
-        run: gradle build --no-daemon
+      - name: Build (MC ${{ matrix.mc }})
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -o pipefail
+          gradle build --no-daemon \
+            -Pminecraft_version=${{ matrix.mc }} \
+            -Pyarn_mappings=${{ steps.ver.outputs.yarn }} \
+            -Ploader_version=${{ steps.ver.outputs.loader }} \
+            -Pfabric_version=${{ steps.ver.outputs.api }} \
+            -Ploom_version=${{ matrix.loom }} 2>&1 | tee build.log
 
-      - name: Upload JAR
+      - name: Tom tat loi (gui anh buoc nay cho Claude)
+        if: failure()
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          echo "=== LOI DUY NHAT (so lan x noi dung) ==="
+          grep -E "error:" build.log | sed -E 's#.*/donutlike/##' | sort | uniq -c | sort -rn | head -60
+          echo "=== SYMBOL ==="
+          grep -E "^\s+symbol:" build.log | sort | uniq -c | sort -rn | head -40
+
+      - name: Upload build log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: DonutLike-Mod
-          path: build/libs/*.jar
+          name: build-log-${{ matrix.mc }}
+          path: ${{ steps.proj.outputs.dir }}/build.log
+          if-no-files-found: ignore
+
+      - name: Collect jar
+        run: |
+          mkdir -p dist
+          for j in "${{ steps.proj.outputs.dir }}"/build/libs/*.jar; do
+            case "$j" in *-sources.jar) continue;; esac
+            b=$(basename "$j" .jar)
+            cp "$j" "dist/${b}-mc${{ matrix.mc }}.jar"
+          done
+          ls -l dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: donutlike-mod-${{ matrix.mc }}
+          path: dist/*.jar
           if-no-files-found: error
+
+      - name: Create Release (khi push tag vX.Y.Z)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.jar
